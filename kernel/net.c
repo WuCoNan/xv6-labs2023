@@ -10,10 +10,16 @@
 #include "proc.h"
 #include "net.h"
 #include "defs.h"
-
+struct arp_cache
+{
+  struct arp_cache_entry entrys[ARP_CACHE_SIZE];
+  struct spinlock lock;
+};
 static uint32 local_ip = MAKE_IP_ADDR(10, 0, 2, 15); // qemu's idea of the guest IP
-static uint8 local_mac[ETHADDR_LEN] = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
-static uint8 broadcast_mac[ETHADDR_LEN] = { 0xFF, 0XFF, 0XFF, 0XFF, 0XFF, 0XFF };
+static uint8 local_mac[ETHADDR_LEN] = {0x52, 0x54, 0x00, 0x12, 0x34, 0x56};
+static uint8 broadcast_mac[ETHADDR_LEN] = {0xFF, 0XFF, 0XFF, 0XFF, 0XFF, 0XFF};
+static uint32 default_gate=MAKE_IP_ADDR(10,0,2,2);
+static struct arp_cache arp_cache;
 
 // Strips data from the start of the buffer and returns a pointer to it.
 // Returns 0 if less than the full requested length is available.
@@ -66,7 +72,7 @@ struct mbuf *
 mbufalloc(unsigned int headroom)
 {
   struct mbuf *m;
- 
+
   if (headroom > MBUF_SIZE)
     return 0;
   m = kalloc();
@@ -80,18 +86,17 @@ mbufalloc(unsigned int headroom)
 }
 
 // Frees a packet buffer.
-void
-mbuffree(struct mbuf *m)
+void mbuffree(struct mbuf *m)
 {
   kfree(m);
 }
 
 // Pushes an mbuf to the end of the queue.
-void
-mbufq_pushtail(struct mbufq *q, struct mbuf *m)
+void mbufq_pushtail(struct mbufq *q, struct mbuf *m)
 {
   m->next = 0;
-  if (!q->head){
+  if (!q->head)
+  {
     q->head = q->tail = m;
     return;
   }
@@ -111,18 +116,30 @@ mbufq_pophead(struct mbufq *q)
 }
 
 // Returns one (nonzero) if the queue is empty.
-int
-mbufq_empty(struct mbufq *q)
+int mbufq_empty(struct mbufq *q)
 {
   return q->head == 0;
 }
 
 // Intializes a queue of mbufs.
-void
-mbufq_init(struct mbufq *q)
+void mbufq_init(struct mbufq *q)
 {
   q->head = 0;
 }
+void arp_cache_init()
+{
+  initlock(&arp_cache.lock, "arp");
+  for (int i = 0; i < ARP_CACHE_SIZE; i++)
+  {
+    struct arp_cache_entry *e = &arp_cache.entrys[i];
+    e->state = 0;
+    for (int j = 0; j < ARP_WAIT_SIZE; j++)
+    {
+      e->queue[j] = 0;
+    }
+  }
+}
+
 
 // This code is lifted from FreeBSD's ping.c, and is copyright by the Regents
 // of the University of California.
@@ -139,13 +156,15 @@ in_cksum(const unsigned char *addr, int len)
    * sequential 16 bit words to it, and at the end, fold back all the
    * carry bits from the top 16 bits into the lower 16 bits.
    */
-  while (nleft > 1)  {
+  while (nleft > 1)
+  {
     sum += *w++;
     nleft -= 2;
   }
 
   /* mop up an odd byte, if necessary */
-  if (nleft == 1) {
+  if (nleft == 1)
+  {
     *(unsigned char *)(&answer) = *(const unsigned char *)w;
     sum += answer;
   }
@@ -161,61 +180,75 @@ in_cksum(const unsigned char *addr, int len)
 
 // sends an ethernet packet
 static void
-net_tx_eth(struct mbuf *m, uint16 ethtype)
+net_tx_eth(struct mbuf *m, uint16 ethtype, uint8 dmac[ETHADDR_LEN])
 {
   struct eth *ethhdr;
+  
 
   ethhdr = mbufpushhdr(m, *ethhdr);
   memmove(ethhdr->shost, local_mac, ETHADDR_LEN);
   // In a real networking stack, dhost would be set to the address discovered
   // through ARP. Because we don't support enough of the ARP protocol, set it
   // to broadcast instead.
-  memmove(ethhdr->dhost, broadcast_mac, ETHADDR_LEN);
+  memmove(ethhdr->dhost, dmac, ETHADDR_LEN);
   ethhdr->type = htons(ethtype);
-  if (e1000_transmit(m)) {
+  if (e1000_transmit(m))
+  {
     mbuffree(m);
   }
 }
-
-// sends an IP packet
-static void
-net_tx_ip(struct mbuf *m, uint8 proto, uint32 dip)
+static int arp_cache_lookup(uint32 ip_addr, uint8 mac_addr[ETHADDR_LEN], struct mbuf *m)
 {
-  struct ip *iphdr;
+  struct arp_cache_entry *e = 0, *free = 0;
 
-  // push the IP header
-  iphdr = mbufpushhdr(m, *iphdr);
-  memset(iphdr, 0, sizeof(*iphdr));
-  iphdr->ip_vhl = (4 << 4) | (20 >> 2);
-  iphdr->ip_p = proto;
-  iphdr->ip_src = htonl(local_ip);
-  iphdr->ip_dst = htonl(dip);
-  iphdr->ip_len = htons(m->len);
-  iphdr->ip_ttl = 100;
-  iphdr->ip_sum = in_cksum((unsigned char *)iphdr, sizeof(*iphdr));
+  acquire(&arp_cache.lock);
 
-  // now on to the ethernet layer
-  net_tx_eth(m, ETHTYPE_IP);
+  for (int i = 0; i < ARP_CACHE_SIZE; i++)
+  {
+    e = &arp_cache.entrys[i];
+
+    if (e->state == 1 && e->ip_addr == ip_addr)
+    {
+      memmove(mac_addr, e->mac_addr, ETHADDR_LEN);
+      release(&arp_cache.lock);
+      return 0;
+    }
+
+    if (e->state == 2 && e->ip_addr == ip_addr)
+    {
+      for (int j = 0; j < ARP_WAIT_SIZE; j++)
+      {
+        if (e->queue[j])
+          continue;
+        else
+        {
+          e->queue[j] = m;
+          break;
+        }
+      }
+      release(&arp_cache.lock);
+      return -1;
+    }
+
+    if (e->state == 0)
+      free = e;
+  }
+
+  if (free == 0)
+  {
+    printf("no free arp cache\n");
+    release(&arp_cache.lock);
+    return -1;
+  }
+
+  free->ip_addr = ip_addr;
+  free->queue[0] = m;
+  free->state = 2;
+
+  release(&arp_cache.lock);
+
+  return -1;
 }
-
-// sends a UDP packet
-void
-net_tx_udp(struct mbuf *m, uint32 dip,
-           uint16 sport, uint16 dport)
-{
-  struct udp *udphdr;
-
-  // put the UDP header
-  udphdr = mbufpushhdr(m, *udphdr);
-  udphdr->sport = htons(sport);
-  udphdr->dport = htons(dport);
-  udphdr->ulen = htons(m->len);
-  udphdr->sum = 0; // zero means no checksum is provided
-
-  // now on to the IP layer
-  net_tx_ip(m, IPPROTO_UDP, dip);
-}
-
 // sends an ARP packet
 static int
 net_tx_arp(uint16 op, uint8 dmac[ETHADDR_LEN], uint32 dip)
@@ -242,9 +275,111 @@ net_tx_arp(uint16 op, uint8 dmac[ETHADDR_LEN], uint32 dip)
   arphdr->tip = htonl(dip);
 
   // header is ready, send the packet
-  net_tx_eth(m, ETHTYPE_ARP);
+  net_tx_eth(m, ETHTYPE_ARP, dmac);
   return 0;
 }
+int is_subnet(uint32 ip_addr)
+{
+  return ip_addr==default_gate;
+}
+// sends an IP packet
+static void
+net_tx_ip(struct mbuf *m, uint8 proto, uint32 dip)
+{
+  struct ip *iphdr;
+  uint8 dmac[ETHADDR_LEN];
+  uint32 next_ip;
+
+  // push the IP header
+  iphdr = mbufpushhdr(m, *iphdr);
+  memset(iphdr, 0, sizeof(*iphdr));
+  iphdr->ip_vhl = (4 << 4) | (20 >> 2);
+  iphdr->ip_p = proto;
+  iphdr->ip_src = htonl(local_ip);
+  iphdr->ip_dst = htonl(dip);
+  iphdr->ip_len = htons(m->len);
+  iphdr->ip_ttl = 100;
+  iphdr->ip_sum = in_cksum((unsigned char *)iphdr, sizeof(*iphdr));
+
+  if(is_subnet(dip))
+    next_ip=dip;
+  else
+    next_ip=default_gate;
+
+  // now on to the ethernet layer
+  if (arp_cache_lookup(next_ip, dmac, m) < 0)
+    net_tx_arp(ARP_OP_REQUEST, broadcast_mac, next_ip);
+  else
+    net_tx_eth(m, ETHTYPE_IP, dmac);
+}
+
+// sends a UDP packet
+void net_tx_udp(struct mbuf *m, uint32 dip,
+                uint16 sport, uint16 dport)
+{
+  struct udp *udphdr;
+
+  // put the UDP header
+  udphdr = mbufpushhdr(m, *udphdr);
+  udphdr->sport = htons(sport);
+  udphdr->dport = htons(dport);
+  udphdr->ulen = htons(m->len);
+  udphdr->sum = 0; // zero means no checksum is provided
+
+  // now on to the IP layer
+  net_tx_ip(m, IPPROTO_UDP, dip);
+}
+
+
+// Add new entry to arp cache
+static int arp_cache_add(uint32 ip_addr, uint8 mac_addr[ETHADDR_LEN])
+{
+  struct arp_cache_entry *e = 0, *free = 0;
+
+  acquire(&arp_cache.lock);
+  //printf("new arp!\n");
+  for (int i = 0; i < ARP_CACHE_SIZE; i++)
+  {
+    e = &arp_cache.entrys[i];
+
+    if (e->ip_addr == ip_addr)
+    {
+      memmove(e->mac_addr, mac_addr, ETHADDR_LEN);
+      e->state = 1;
+
+      for (int j = 0; j < ARP_WAIT_SIZE; j++)
+      {
+        if (e->queue[j])
+        {
+          net_tx_eth(e->queue[j], ETHTYPE_IP, e->mac_addr);
+          e->queue[j] = 0;
+        }
+      }
+
+      release(&arp_cache.lock);
+      return 0;
+    }
+
+    if (e->state == 0)
+      free = e;
+  }
+
+  if (free == 0)
+  {
+    printf("no free arp cache\n");
+    release(&arp_cache.lock);
+    return -1;
+  }
+
+  free->ip_addr = ip_addr;
+  memmove(free->mac_addr, mac_addr, ETHADDR_LEN);
+  free->state = 1;
+
+  release(&arp_cache.lock);
+
+  return 0;
+}
+
 
 // receives an ARP packet
 static void
@@ -262,19 +397,24 @@ net_rx_arp(struct mbuf *m)
   if (ntohs(arphdr->hrd) != ARP_HRD_ETHER ||
       ntohs(arphdr->pro) != ETHTYPE_IP ||
       arphdr->hln != ETHADDR_LEN ||
-      arphdr->pln != sizeof(uint32)) {
+      arphdr->pln != sizeof(uint32))
+  {
     goto done;
   }
 
   // only requests are supported so far
   // check if our IP was solicited
-  tip = ntohl(arphdr->tip); // target IP address
+  tip = ntohl(arphdr->tip);                // target IP address
+  memmove(smac, arphdr->sha, ETHADDR_LEN); // sender's ethernet address
+  sip = ntohl(arphdr->sip);                // sender's IP address (qemu's slirp)
+
+  arp_cache_add(sip, smac); // learn arp cache
+
   if (ntohs(arphdr->op) != ARP_OP_REQUEST || tip != local_ip)
     goto done;
 
   // handle the ARP request
-  memmove(smac, arphdr->sha, ETHADDR_LEN); // sender's ethernet address
-  sip = ntohl(arphdr->sip); // sender's IP address (qemu's slirp)
+
   net_tx_arp(ARP_OP_REPLY, smac, sip);
 
 done:
@@ -288,7 +428,6 @@ net_rx_udp(struct mbuf *m, uint16 len, struct ip *iphdr)
   struct udp *udphdr;
   uint32 sip;
   uint16 sport, dport;
-
 
   udphdr = mbufpullhdr(m, *udphdr);
   if (!udphdr)
@@ -325,7 +464,7 @@ net_rx_ip(struct mbuf *m)
 
   iphdr = mbufpullhdr(m, *iphdr);
   if (!iphdr)
-	  goto fail;
+    goto fail;
 
   // check IP version and header len
   if (iphdr->ip_vhl != ((4 << 4) | (20 >> 2)))
@@ -359,7 +498,8 @@ void net_rx(struct mbuf *m)
   uint16 type;
 
   ethhdr = mbufpullhdr(m, *ethhdr);
-  if (!ethhdr) {
+  if (!ethhdr)
+  {
     mbuffree(m);
     return;
   }

@@ -171,3 +171,15 @@ struct dns_data {
   uint32 ttl;
   uint16 len;
 } __attribute__((packed));
+
+#define ARP_WAIT_SIZE 10
+#define ARP_CACHE_SIZE 5
+struct arp_cache_entry
+{
+  uint32 ip_addr;
+  uint8 mac_addr[ETHADDR_LEN];
+  struct mbuf* queue[ARP_WAIT_SIZE];
+  int state;
+};
+
+void arp_cache_init();

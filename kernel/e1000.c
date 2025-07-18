@@ -28,6 +28,7 @@ void
 e1000_init(uint32 *xregs)
 {
   int i;
+  arp_cache_init();
 
   initlock(&e1000_lock, "e1000");
 
